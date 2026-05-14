@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["garminconnect==0.2.38", "cloudscraper"]
+# dependencies = ["garminconnect>=0.2.38,<0.3.0", "cloudscraper"]
 # ///
 """Sync daily health data from Garmin Connect into markdown files."""
 
@@ -92,8 +92,9 @@ def authenticate() -> Garmin:
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     tokenstore = str(TOKEN_DIR)
 
+    backoff_schedule = [5, 15, 30, 60, 120]
     last_exc: Exception | None = None
-    for attempt in range(5):
+    for attempt, delay in enumerate(backoff_schedule):
         try:
             client.login(tokenstore)
             return client
@@ -107,8 +108,13 @@ def authenticate() -> Garmin:
             sys.exit(1)
         except Exception as e:
             last_exc = e
-            if attempt < 4 and "no profile" in str(e).lower():
-                time.sleep(2 * (attempt + 1))
+            if attempt < len(backoff_schedule) - 1 and "no profile" in str(e).lower():
+                print(
+                    f"  Garmin profile endpoint unavailable, retrying in {delay}s "
+                    f"(attempt {attempt + 1}/{len(backoff_schedule)})...",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
                 continue
             break
 
@@ -681,7 +687,7 @@ def fetch_activities(client: Garmin, day: str) -> str | None:
 def sync_day(client: Garmin, day: date, output_dir: Path) -> None:
     """Sync a single day's data and write the markdown file."""
     day_str = day.isoformat()
-    display_date = day.strftime("%B %-d, %Y")
+    display_date = f"{day:%B} {day.day}, {day.year}"
 
     sections = [f"# Health — {display_date}"]
 
@@ -727,7 +733,7 @@ def sync_day(client: Garmin, day: date, output_dir: Path) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"{day_str}.md"
-    output_file.write_text("\n\n".join(sections) + "\n")
+    output_file.write_text("\n\n".join(sections) + "\n", encoding="utf-8")
     print(f"  {day_str}: Written to {output_file}")
 
 
