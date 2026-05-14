@@ -86,15 +86,17 @@ def setup(email: str) -> None:
 
 def authenticate() -> Garmin:
     """Authenticate with Garmin Connect using cached tokens only."""
-    client = Garmin()
-    client.garth.sess = cloudscraper.create_scraper()
-
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     tokenstore = str(TOKEN_DIR)
 
-    backoff_schedule = [5, 15, 30, 60, 120]
+    # Cloudflare poisons the cloudscraper session cookies on a failed attempt,
+    # so a fresh Garmin client and scraper per try is what actually fixes the
+    # 'No profile from connectapi' loop — not just sleeping.
+    backoff_schedule = [1, 2, 5, 10, 20]
     last_exc: Exception | None = None
     for attempt, delay in enumerate(backoff_schedule):
+        client = Garmin()
+        client.garth.sess = cloudscraper.create_scraper()
         try:
             client.login(tokenstore)
             return client
@@ -110,7 +112,7 @@ def authenticate() -> Garmin:
             last_exc = e
             if attempt < len(backoff_schedule) - 1 and "no profile" in str(e).lower():
                 print(
-                    f"  Garmin profile endpoint unavailable, retrying in {delay}s "
+                    f"  Garmin profile endpoint unavailable, retrying with fresh session in {delay}s "
                     f"(attempt {attempt + 1}/{len(backoff_schedule)})...",
                     file=sys.stderr,
                 )
@@ -681,7 +683,104 @@ def fetch_activities(client: Garmin, day: str) -> str | None:
         if details:
             lines.append("  " + " | ".join(details))
 
+        activity_id = act.get("activityId")
+        if activity_id:
+            splits_lines = fetch_activity_splits(client, act, activity_id)
+            if splits_lines:
+                # Tables must break out of the surrounding bullet list to render.
+                lines.append("")
+                lines.extend(splits_lines)
+                lines.append("")
+
     return "\n".join(lines)
+
+
+def fetch_activity_splits(client: Garmin, act: dict, activity_id: int) -> list[str]:
+    """Fetch lap splits for an activity and format as a markdown table.
+
+    Returns an empty list when the call fails, the activity has 0–1 laps
+    (single-lap tables would duplicate the summary line above), or the data
+    is otherwise unusable.
+    """
+    try:
+        splits = client.get_activity_splits(activity_id)
+    except Exception as e:
+        if VERBOSE:
+            print(
+                f"    [verbose] Activity splits fetch failed for {activity_id}: {e}",
+                file=sys.stderr,
+            )
+        return []
+
+    laps = (splits or {}).get("lapDTOs") or []
+    if len(laps) < 2:
+        return []
+
+    type_key = ((act.get("activityType") or {}).get("typeKey") or "").lower()
+    use_kmh = "cycl" in type_key or "bik" in type_key
+    spd_header = "Speed" if use_kmh else "Pace"
+
+    out = [
+        f"Splits ({len(laps)} laps):",
+        f"| Lap | Dist | Time | {spd_header} | HR avg/max | Cad | Pwr avg/max | Elev | kcal |",
+        "|-----|------|------|------|------------|-----|-------------|------|------|",
+    ]
+
+    for lap in laps:
+        out.append("| " + " | ".join(_format_lap_row(lap, use_kmh)) + " |")
+
+    return out
+
+
+def _format_lap_row(lap: dict, use_kmh: bool) -> list[str]:
+    """Format one lap dict into row cells (with '—' for missing values)."""
+    lap_idx = lap.get("lapIndex")
+    lap_idx_s = str(lap_idx) if lap_idx is not None else "—"
+
+    dist_m = lap.get("distance")
+    dist_s = f"{dist_m / 1000:.2f} km" if dist_m and dist_m > 0 else "—"
+
+    time_s = fmt_duration_mmss(lap.get("duration"))
+
+    spd_ms = lap.get("averageSpeed")
+    if spd_ms and spd_ms > 0:
+        if use_kmh:
+            spd_s = f"{spd_ms * 3.6:.1f} km/h"
+        else:
+            pace_sec = 1000 / spd_ms
+            spd_s = f"{int(pace_sec) // 60}:{int(pace_sec) % 60:02d}/km"
+    else:
+        spd_s = "—"
+
+    hr_avg = lap.get("averageHR")
+    hr_max = lap.get("maxHR")
+    if hr_avg and hr_avg > 0:
+        hr_s = f"{int(hr_avg)}"
+        if hr_max and hr_max > 0:
+            hr_s += f"/{int(hr_max)}"
+    else:
+        hr_s = "—"
+
+    cad = lap.get("averageRunCadence")
+    cad_s = str(int(cad)) if cad and cad > 0 else "—"
+
+    pwr_avg = lap.get("averagePower")
+    pwr_max = lap.get("maxPower")
+    if pwr_avg and pwr_avg > 0:
+        pwr_s = f"{int(pwr_avg)}"
+        if pwr_max and pwr_max > 0:
+            pwr_s += f"/{int(pwr_max)}"
+        pwr_s += " W"
+    else:
+        pwr_s = "—"
+
+    elev_g = lap.get("elevationGain")
+    elev_s = f"+{int(elev_g)}m" if elev_g is not None else "—"
+
+    kcal = lap.get("calories")
+    kcal_s = str(int(kcal)) if kcal and kcal > 0 else "—"
+
+    return [lap_idx_s, dist_s, time_s, spd_s, hr_s, cad_s, pwr_s, elev_s, kcal_s]
 
 
 def sync_day(client: Garmin, day: date, output_dir: Path) -> None:
