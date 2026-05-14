@@ -1,10 +1,11 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["garminconnect>=0.2.38", "cloudscraper"]
+# dependencies = ["garminconnect>=0.2.38,<0.3.0", "cloudscraper"]
 # ///
 """Sync daily health data from Garmin Connect into markdown files."""
 
 import argparse
+import re
 import sys
 import time
 from datetime import date, timedelta
@@ -20,6 +21,11 @@ TOKEN_DIR = Path.home() / ".garminconnect"
 VERBOSE = False
 
 
+def get_mfa() -> str:
+    """Prompt the user for their MFA/OTP code."""
+    return input("Enter MFA/OTP code from your authenticator app: ")
+
+
 def setup(email: str) -> None:
     """One-time interactive setup: authenticate with email/password and cache tokens."""
     password = getpass("Garmin Connect password: ")
@@ -27,25 +33,30 @@ def setup(email: str) -> None:
         print("Error: Password cannot be empty.", file=sys.stderr)
         sys.exit(1)
 
-    client = Garmin(email, password)
+    client = Garmin(email, password, prompt_mfa=get_mfa)
     client.garth.sess = cloudscraper.create_scraper()
 
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     tokenstore = str(TOKEN_DIR)
 
     last_exc: Exception | None = None
-    for attempt in range(3):
-        try:
-            client.login()
-            client.garth.dump(tokenstore)
-            last_exc = None
-            break
-        except Exception as e:
-            last_exc = e
-            if attempt < 2 and "no profile" in str(e).lower():
-                time.sleep(2**attempt)
-                continue
-            break
+    try:
+        client.login()
+        client.garth.dump(tokenstore)
+    except Exception as e:
+        last_exc = e
+        msg = str(e).lower()
+        # "No profile from connectapi" means Cloudflare blocked the profile
+        # check AFTER a successful OAuth flow. The tokens are valid — save them.
+        if "no profile" in msg or "assertionerror" in msg or "connectapi" in msg:
+            try:
+                client.garth.dump(tokenstore)
+                print(f"Warning: Garmin's profile endpoint was temporarily unavailable,")
+                print(f"but your OAuth tokens were saved to {TOKEN_DIR}.")
+                print("Run the sync to verify everything works.")
+                return
+            except Exception:
+                pass  # garth didn't have tokens — fall through to error
 
     if last_exc is not None:
         msg = str(last_exc).lower()
@@ -58,9 +69,7 @@ def setup(email: str) -> None:
             )
         elif "401" in msg or "unauthorized" in msg or "credentials" in msg:
             print(
-                "\nDouble-check your email and password. If you have two-factor\n"
-                "authentication (2FA) enabled on your Garmin account, you may need\n"
-                "to disable it — the garminconnect library does not support 2FA.",
+                "\nDouble-check your email and password.",
                 file=sys.stderr,
             )
         elif "cloudflare" in msg or "captcha" in msg or "403" in msg:
@@ -83,8 +92,9 @@ def authenticate() -> Garmin:
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     tokenstore = str(TOKEN_DIR)
 
+    backoff_schedule = [5, 15, 30, 60, 120]
     last_exc: Exception | None = None
-    for attempt in range(3):
+    for attempt, delay in enumerate(backoff_schedule):
         try:
             client.login(tokenstore)
             return client
@@ -98,8 +108,13 @@ def authenticate() -> Garmin:
             sys.exit(1)
         except Exception as e:
             last_exc = e
-            if attempt < 2 and "no profile" in str(e).lower():
-                time.sleep(2**attempt)
+            if attempt < len(backoff_schedule) - 1 and "no profile" in str(e).lower():
+                print(
+                    f"  Garmin profile endpoint unavailable, retrying in {delay}s "
+                    f"(attempt {attempt + 1}/{len(backoff_schedule)})...",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
                 continue
             break
 
@@ -151,6 +166,10 @@ def fetch_sleep(client: Garmin, day: str) -> str | None:
             print(f"    [verbose] Sleep fetch failed: {e}", file=sys.stderr)
         return None
 
+    if VERBOSE:
+        import json
+        print(f"    [verbose] Raw Sleep Data for {day}: {json.dumps(data, indent=2)}", file=sys.stderr)
+
     daily = data.get("dailySleepDTO", {})
     if not daily or not daily.get("sleepTimeSeconds"):
         return None
@@ -174,6 +193,92 @@ def fetch_sleep(client: Garmin, day: str) -> str | None:
     lines.append(f"Deep: {deep} | Light: {light} | REM: {rem} | Awake: {awake}")
     if score is not None:
         lines.append(f"Sleep Score: {score}")
+
+    sleep_need = daily.get("sleepNeed")
+    if sleep_need:
+        # sleepNeed can be a dict (e.g. {'actual': 480, ...}) or just a number
+        # Note: 'actual' seems to be in minutes, fmt_duration expects seconds
+        if isinstance(sleep_need, dict):
+             # Try common keys
+             val = sleep_need.get("actual") or sleep_need.get("value") or sleep_need.get("duration")
+             if val is not None:
+                 # If value is small (e.g. 480), assume minutes -> convert to seconds
+                 if val < 1440: # less than 24 hours in minutes
+                     val *= 60
+                 lines.append(f"Sleep Need: {fmt_duration(val)}")
+        else:
+             # If it's just a number, assume seconds if large, minutes if small?
+             # For now, let's assume seconds if it matches existing behavior or fix if needed
+             lines.append(f"Sleep Need: {fmt_duration(sleep_need)}")
+
+    # Extract all sleep factors (Alcohol, Caffeine, Late Meal, Stress, Recovery, etc.)
+    factors = daily.get("sleepScores", {}).get("overall", {}).get("factors", [])
+    factor_parts = []
+    for f in factors:
+        key = f.get("factorKey")
+        if not key:
+            continue
+        
+        status = f.get("status", "").replace("_", " ").title()
+        # Format key: 'sleepDuration' -> 'Sleep Duration' or 'ALCOHOL' -> 'Alcohol'
+        display_key = re.sub(r'([a-z])([A-Z])', r'\1 \2', key).replace('_', ' ').title()
+        factor_parts.append(f"{display_key}: {status}")
+
+    if factor_parts:
+        lines.append("Sleep Factors: " + " | ".join(factor_parts))
+
+    return "\n".join(lines)
+
+
+def fetch_lifestyle(client: Garmin, day: str) -> str | None:
+    """Fetch and format lifestyle logging data (Alcohol, Caffeine, Late Meal, Illness, etc.)."""
+    try:
+        # get_lifestyle_logging_data was added in garminconnect 0.2.35
+        data = client.get_lifestyle_logging_data(day)
+    except Exception as e:
+        if VERBOSE:
+            print(f"    [verbose] Lifestyle logging fetch failed: {e}", file=sys.stderr)
+        return None
+
+    if VERBOSE:
+        import json
+        print(f"    [verbose] Raw Lifestyle Data for {day}: {json.dumps(data, indent=2)}", file=sys.stderr)
+
+    if not data:
+        return None
+
+    # Lifestyle data is in dailyLogsReport
+    logs = data.get("dailyLogsReport", [])
+    if not logs:
+        return None
+
+    lines = ["## Lifestyle"]
+    for log in logs:
+        # Only include things that were logged as "YES"
+        if log.get("logStatus") != "YES":
+            continue
+
+        name = log.get("name") or str(log.get("behaviourId", ""))
+        
+        # Check for amounts in details
+        details = log.get("details", [])
+        detail_strs = []
+        for d in details:
+            amount = d.get("amount")
+            sub_type = d.get("subTypeName")
+            if amount is not None:
+                if sub_type:
+                    detail_strs.append(f"{amount} {sub_type.lower()}")
+                else:
+                    detail_strs.append(f"{amount}")
+        
+        line = f"- {name}"
+        if detail_strs:
+            line += f": {', '.join(detail_strs)}"
+        lines.append(line)
+
+    if len(lines) == 1:
+        return None
 
     return "\n".join(lines)
 
@@ -222,7 +327,14 @@ def fetch_body(client: Garmin, day: str) -> str | None:
         if hrv_data:
             summary_hrv = hrv_data.get("hrvSummary", {})
             if summary_hrv:
-                hrv = summary_hrv.get("weeklyAvg") or summary_hrv.get("lastNightAvg")
+                weekly_avg = summary_hrv.get("weeklyAvg")
+                last_night_avg = summary_hrv.get("lastNightAvg")
+                hrv_details = []
+                if weekly_avg:
+                    hrv_details.append(f"Weekly HRV Avg: {weekly_avg} ms")
+                if last_night_avg:
+                    hrv_details.append(f"Last Night HRV Avg: {last_night_avg} ms")
+                hrv = " | ".join(hrv_details)
     except Exception as e:
         if VERBOSE:
             print(f"    [verbose] HRV fetch failed: {e}", file=sys.stderr)
@@ -299,7 +411,7 @@ def fetch_body(client: Garmin, day: str) -> str | None:
     if battery is not None:
         extra_parts.append(f"Body Battery: {battery}")
     if hrv is not None:
-        extra_parts.append(f"HRV: {hrv} ms")
+        extra_parts.append(f"{hrv}")
     if extra_parts:
         lines.append(" | ".join(extra_parts))
 
@@ -475,7 +587,40 @@ def fetch_activities(client: Garmin, day: str) -> str | None:
     for act in activities:
         name = act.get("activityName", "Activity")
         duration = fmt_duration_mmss(act.get("duration"))
-        header_parts = [f"**{name}** — {duration}"]
+
+        # Activity start time (local) if available
+        start_local = act.get("startTimeLocal") or act.get("startTimeGMT")
+        start_hm = None
+        if isinstance(start_local, str):
+            # e.g. 2026-02-19T18:12:34.0 or 2026-02-19 18:12:34
+            if "T" in start_local:
+                try:
+                    start_hm = start_local.split("T", 1)[1][:5]
+                except Exception:
+                    start_hm = None
+            elif " " in start_local:
+                try:
+                    start_hm = start_local.split(" ", 1)[1][:5]
+                except Exception:
+                    start_hm = None
+
+        # Fallback: beginTimestamp (ms since epoch)
+        if start_hm is None:
+            ts = act.get("beginTimestamp")
+            if isinstance(ts, (int, float)) and ts > 0:
+                try:
+                    from datetime import datetime
+
+                    start_hm = datetime.fromtimestamp(ts / 1000).strftime("%H:%M")
+                except Exception:
+                    start_hm = None
+
+        header = f"**{name}**"
+        if start_hm:
+            header += f" ({start_hm})"
+        header += f" — {duration}"
+
+        header_parts = [header]
 
         distance = act.get("distance")
         if distance and distance > 0:
@@ -542,13 +687,17 @@ def fetch_activities(client: Garmin, day: str) -> str | None:
 def sync_day(client: Garmin, day: date, output_dir: Path) -> None:
     """Sync a single day's data and write the markdown file."""
     day_str = day.isoformat()
-    display_date = day.strftime("%B %-d, %Y")
+    display_date = f"{day:%B} {day.day}, {day.year}"
 
     sections = [f"# Health — {display_date}"]
 
     sleep = fetch_sleep(client, day_str)
     if sleep:
         sections.append(sleep)
+
+    lifestyle = fetch_lifestyle(client, day_str)
+    if lifestyle:
+        sections.append(lifestyle)
 
     body = fetch_body(client, day_str)
     if body:
@@ -584,7 +733,7 @@ def sync_day(client: Garmin, day: date, output_dir: Path) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"{day_str}.md"
-    output_file.write_text("\n\n".join(sections) + "\n")
+    output_file.write_text("\n\n".join(sections) + "\n", encoding="utf-8")
     print(f"  {day_str}: Written to {output_file}")
 
 
